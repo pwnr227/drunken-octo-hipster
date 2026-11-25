@@ -1,0 +1,97 @@
+Ref,Qty,Value / Description,Package,Manufacturer,MPN,Notes
+U1,1,Ideal diode controller,SOT-23-6,Texas Instruments,LM74700QDBVRQ1,Reverse polarity protection
+Q1 Q2,2,N-MOSFET 60V 1.6mOhm,SuperSO8 (TDSON-8),Infineon,BSC016N06NS,Ideal-diode pass FETs in parallel
+D1,1,TVS 33V unidirectional 3kW,SMC (DO-214AB),Littelfuse,SMDJ33A,VIN surge clamp
+C1 C2,2,330uF 50V low-ESR aluminium electrolytic,10x12.5mm radial,Panasonic,EEU-FR1H331L,Bulk VIN
+C3-C6,4,4.7uF 50V X7R,1210,Murata,GRM32ER71H475KA88L,VIN at FET bank
+F6,1,Fuse 2A fast,1206,Littelfuse,0466002.NR,Logic rail fuse
+U2,1,Buck 3.8-36V 3A 400kHz,WSON-8 (DDA HSOIC-8),Texas Instruments,LMR33630ADDAR,+12V gate drive / fans
+L1,1,15uH 4A shielded inductor,7.3x7.3mm,Wurth Elektronik,74439346150,
+U3,1,Buck 3.8-36V 2A 400kHz,HSOIC-8,Texas Instruments,LMR33620ADDAR,+5V
+L2,1,10uH 3A shielded inductor,6x6mm,Wurth Elektronik,74438357100,
+C10 C20,2,10uF 50V X7R,1210,Murata,GRM32ER71H106KA12L,Buck input
+C11 C21,2,100nF 50V X7R,0603,any,,Buck input HF
+C12 C22,2,100nF 16V X7R,0603,any,,CBOOT
+C13 C23,2,1uF 16V X7R,0603,any,,VCC
+C14 C15,2,22uF 25V X7R,1210,Murata,GRM32ER71E226KE15L,+12V output
+C24-C26,3,22uF 16V X7R,1206,Murata,GRM31CR71C226ME15L,+5V output
+R10 R12,2,100k 1%,0603,any,,FB top
+R11,1,9.09k 1%,0603,any,,FB bottom 12V
+R13,1,24.9k 1%,0603,any,,FB bottom 5V
+U4,1,LDO 3.3V 600mA,SOT-23-5,Diodes Inc,AP2112K-3.3TRG1,+3V3
+C30 C31,2,1uF 16V X7R,0603,any,,
+C32,1,10uF 10V X5R,0805,any,,
+D3,1,Zener 3.6V 500mW,SOD-123,onsemi,BZT52C3V6,3V3 back-feed clamp
+FB1,1,Ferrite bead 600R@100MHz,0603,Murata,BLM18KG601SN1D,VDDA filter
+C33,1,1uF 16V X7R,0603,any,,VDDA
+C34,1,100nF 16V X7R,0603,any,,VDDA
+D4,1,Schottky 40V 1A,SMA,onsemi,SS14,USB VBUS jumper path
+JP1 JP2 JP10-JP14,7,2-pin 2.54mm header + shunt,THT,any,,USB PWR / CAN TERM / PT1000 x5
+JP3,1,3-pin 2.54mm header + shunt,THT,any,,FAN V select
+U5,1,MCU STM32G0B1 128KB,LQFP-48,STMicroelectronics,STM32G0B1CBT6,Klipper MCU
+Y1,1,Crystal 8MHz CL=8pF,3.2x2.5mm,Abracon,ABM8-8.000MHZ-B2-T,
+C40 C41,2,12pF C0G,0402,any,,Crystal load
+C42,1,100nF,0603,any,,NRST
+C43,1,4.7uF 10V X5R,0603,any,,VDD bulk
+C44,1,100nF,0402,any,,VDD
+SW1 SW2,2,Tactile switch SPST,SMD 4x4mm,C&K,PTS820 J20M SMTR LFS,RESET / BOOT
+R20,1,10k,0603,any,,BOOT0 pull-down
+R21,1,1k,0603,any,,Status LED
+D6,1,LED green,0603,any,,Status (PA15)
+D5,1,LED blue,0603,any,,3V3 power
+R3,1,2.2k,0603,any,,
+D2,1,LED green,0805,any,,VIN present
+R2,1,10k,0805,any,,
+J2,1,USB-C receptacle 16-pin USB2.0,SMD+THT,GCT,USB4105-GF-A,
+R22 R23,2,5.1k 1%,0603,any,,CC pull-downs
+U6,1,USB ESD protection,SOT-23-6,STMicroelectronics,USBLC6-2SC6,
+R24,1,1M,0603,any,,Shield bleed
+C45,1,4.7nF 250V,1206,any,,Shield
+J6,1,1x5 2.54mm header,THT,any,,SWD
+J7,1,1x4 2.54mm header,THT,any,,AUX
+U7,1,CAN transceiver 5V w/ VIO,SO-8,NXP,TJA1051T/3/1J,
+C50 C51,2,100nF,0603,any,,
+D7,1,CAN ESD protection,SOT-23,Nexperia,PESD2CAN,215
+R30,1,120R 1%,0805,any,,CAN termination (via JP2)
+J3 J4,2,JST-XH 3-pin,THT,JST,B3B-XH-A,CAN in/out
+J20-J24,5,JST-XH 2-pin,THT,JST,B2B-XH-A,Thermistor 0-4
+R40-R44,5,4.7k 0.1% 25ppm,0805,Vishay,TNPW08054K70BEEA,Thermistor pull-up
+R50-R54,5,1.27k 0.1% 25ppm 0.4W,2010,Vishay,TNPW20101K27BEEF,PT1000 parallel pull-up
+R60-R64,5,10k 1%,0603,any,,Thermistor series protection
+C60-C64,5,100nF X7R,0603,any,,Thermistor filter
+D60-D64,5,Dual Schottky series,SOT-23,Nexperia,BAT54S,215
+RT1,1,NTC 100k B4250,0603,Murata,NCP18WF104F03RC,Board / FET temperature
+R7,1,4.7k 0.1%,0805,Vishay,TNPW08054K70BEEA,RT1 pull-up
+C9,1,100nF,0603,any,,
+R8,1,100k 1%,0603,any,,VIN sense top
+R9,1,10k 1%,0603,any,,VIN sense bottom
+C8,1,100nF,0603,any,,
+C7,1,100nF 50V X7R,0603,any,,LM74700 VCAP
+R1,1,100k,0603,any,,LM74700 EN
+U10-U12,3,Dual 5A low-side gate driver,SOIC-8,Texas Instruments,UCC27524ADR,Heater gate drivers
+C70-C72,3,1uF 25V X7R,0603,any,,Driver VDD
+C73-C75,3,100nF 25V X7R,0402,any,,Driver VDD
+R70-R74,5,100R,0603,any,,MCU-to-driver series
+R80-R84,5,100k,0603,any,,Driver input pull-down
+R90-R94,5,4.7R,0603,any,,Gate resistor
+R100-R104,5,10k,0603,any,,Gate-source pull-down
+Q10-Q14,5,N-MOSFET 60V 2.8mOhm,SuperSO8 (TDSON-8),Infineon,BSC028N06LS3 G,Heater switches
+F1-F5,5,Fuse 10A ATM mini blade 32V,Blade,Littelfuse,0297010.WXNV,Heater channel fuse
+FH1-FH5,5,Mini blade fuse holder PCB,THT,Keystone,3568,
+D10-D14,5,Schottky 60V 5A,SMC,Diodes Inc,B560C-13-F,Heater flyback
+D15-D19,5,LED red,0805,any,,Heater on
+R110-R114,5,10k,0805,any,,Heater LED
+J10-J14,5,2-pos pluggable header 5.08mm 12A,THT,Phoenix Contact,1757242,MSTBA 2.5/2-G-5.08
+P10-P14,5,2-pos plug 5.08mm (mates J10-J14),Plug,Phoenix Contact,1757019,MSTB 2.5/2-ST-5.08
+J1,1,XT90 male right-angle PCB,THT,Amass,XT90PW-M,Power input 40A
+J5,1,JST-XH 2-pin,THT,JST,B2B-XH-A,Heater interlock
+JP5,1,Shorting plug for J5 (XH housing with looped wire),-,JST,XHP-2,Default interlock closed
+R120,1,1k,0603,any,,Interlock source
+R121,1,10k,0603,any,,HTR_EN pull-down
+R122,1,12k 1%,0603,any,,IL_SENSE divider
+R123,1,22k 1%,0603,any,,IL_SENSE divider
+Q20 Q21,2,N-MOSFET 30V 5.7A,SOT-23,Alpha & Omega,AO3400A,Fan switches
+R130 R131,2,100R,0603,any,,Fan gate
+R132 R133,2,100k,0603,any,,Fan gate pull-down
+D20 D21,2,Schottky 40V 1A,SMA,onsemi,SS14,Fan flyback
+J30 J31,2,JST-XH 2-pin,THT,JST,B2B-XH-A,Fan 0/1
