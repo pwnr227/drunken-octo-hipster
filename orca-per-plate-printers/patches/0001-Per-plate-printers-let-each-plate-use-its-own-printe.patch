@@ -1,0 +1,1509 @@
+From a90249dd802273130baf972340b37107396f633f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 26 Nov 2026 00:04:37 +0000
+Subject: [PATCH] Per-plate printers: let each plate use its own printer and
+ process
+
+A plate can name its own printer preset, and optionally its own process
+preset, in the Plate Settings dialog. The plate is then drawn with that
+printer's bed and sliced with that printer's settings, so one project can
+hold plates for different machines.
+
+- libslic3r/PlatePresetOverride: resolves the plate's presets and overlays
+  them on the project's full config, with full_fff_config()'s precedence,
+  after checking the printer is compatible (FFF, same extruder count and
+  variants).
+- BackgroundSlicingProcess::apply() applies it where the plate settings are
+  applied; validate() reports a plate whose presets cannot be applied, and
+  is_BBL_printer() follows the plate's printer.
+- PartPlate / PartPlateList keep the presets per plate, give each plate its
+  printer's bed, and size the plate grid to fit every bed. Without
+  overrides the layout is unchanged.
+- Saved in the plate metadata of the 3MF (orca_printer_preset,
+  orca_process_preset), and part of undo/redo.
+- Outside-the-plate checks and single-plate arrange use the plate's bed.
+
+See docs/HLSD/per-plate-printers.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Qov2bq4ZFeZHAGDRsTH8Kh
+---
+ docs/HLSD/per-plate-printers.md               |  85 ++++++++++
+ localization/i18n/list.txt                    |   1 +
+ src/libslic3r/CMakeLists.txt                  |   2 +
+ src/libslic3r/Format/bbs_3mf.cpp              |  16 ++
+ src/libslic3r/Format/bbs_3mf.hpp              |   3 +
+ src/libslic3r/PlatePresetOverride.cpp         | 149 +++++++++++++++++
+ src/libslic3r/PlatePresetOverride.hpp         |  75 +++++++++
+ src/slic3r/GUI/3DScene.cpp                    |   4 +-
+ src/slic3r/GUI/BackgroundSlicingProcess.cpp   |  28 +++-
+ src/slic3r/GUI/BackgroundSlicingProcess.hpp   |   5 +
+ src/slic3r/GUI/GLCanvas3D.cpp                 |   3 +
+ src/slic3r/GUI/Jobs/ArrangeJob.cpp            |   7 +
+ src/slic3r/GUI/PartPlate.cpp                  | 154 ++++++++++++++++--
+ src/slic3r/GUI/PartPlate.hpp                  |  56 ++++++-
+ src/slic3r/GUI/PlateSettingsDialog.cpp        |  98 +++++++++++
+ src/slic3r/GUI/PlateSettingsDialog.hpp        |  15 ++
+ src/slic3r/GUI/Plater.cpp                     |  17 +-
+ tests/fff_print/CMakeLists.txt                |   1 +
+ .../fff_print/test_plate_preset_override.cpp  |  40 +++++
+ tests/libslic3r/CMakeLists.txt                |   1 +
+ tests/libslic3r/test_3mf.cpp                  |  60 +++++++
+ .../libslic3r/test_plate_preset_override.cpp  | 132 +++++++++++++++
+ 22 files changed, 931 insertions(+), 21 deletions(-)
+ create mode 100644 docs/HLSD/per-plate-printers.md
+ create mode 100644 src/libslic3r/PlatePresetOverride.cpp
+ create mode 100644 src/libslic3r/PlatePresetOverride.hpp
+ create mode 100644 tests/fff_print/test_plate_preset_override.cpp
+ create mode 100644 tests/libslic3r/test_plate_preset_override.cpp
+
+diff --git a/docs/HLSD/per-plate-printers.md b/docs/HLSD/per-plate-printers.md
+new file mode 100644
+index 00000000..757010ba
+--- /dev/null
++++ b/docs/HLSD/per-plate-printers.md
+@@ -0,0 +1,85 @@
++# Per-plate printers - High Level Design
++
++## Purpose and scope
++
++A project normally slices every plate with the printer and process presets selected in the
++sidebar. Per-plate printers let a plate name its own printer preset, and optionally its own
++process preset, so one project can hold plates for different machines: a plate for a
++256 x 256 mm printer next to a plate for a 180 x 180 mm one, each sliced with its own bed,
++limits, start and end G-code and firmware flavor.
++
++The plate's printer and process are chosen in the Plate Settings dialog ("Printer" and
++"Process"). Choosing "Same as project printer" / "Same as project process" removes the
++override. A plate with its own presets shows the plate settings icon as changed, and its
++tooltip names the plate's printer.
++
++Filaments, the project config (filament colours, flush volumes, ...) and the other plate
++settings stay shared with the rest of the project.
++
++## Data model
++
++`PartPlate` holds a `PlatePresetOverride` (`libslic3r/PlatePresetOverride.hpp`): two preset
++names, empty meaning "the project's". The plate's settings in `PartPlate::m_config` are not used
++for it, because every key there must be a `PrintConfig` option, and a preset name is a project
++reference rather than a print setting.
++
++The override is saved in the plate's metadata in `Metadata/model_settings.config` as
++`orca_printer_preset` and `orca_process_preset`, written only when set. Versions without the
++feature ignore those keys and slice the plate with the project's presets. Only the names are
++saved: a project that names a user preset the receiving machine does not have reports the
++missing preset when that plate is sliced. The names are also part of the plate's undo/redo
++snapshot.
++
++## Slicing
++
++`BackgroundSlicingProcess::apply()` already layers the plate's own settings over the project's
++full config (`PresetBundle::full_config()`). The override is applied at the same point, before
++the plate settings, by `apply_plate_preset_override()`:
++
++- the process preset's `print_options()` are copied over, except keys that are printer,
++  filament or project keys;
++- the printer preset's `printer_options()` are copied over, except project keys;
++- `print_settings_id` / `printer_settings_id` name the plate's presets.
++
++This mirrors the precedence of `PresetBundle::full_fff_config()` (process < filament < printer
++< project), so a plate with its own presets gets the config the project would get with those
++presets selected, for the keys a preset owns.
++
++The full config's per-filament and per-extruder vectors are sized and resolved for the
++project's printer, so the plate's printer must be an FFF printer with the same number of
++extruders and, for a multi-extruder printer, the same extruder variants. The Plate Settings
++dialog only offers printers with the project's extruder count. When an override cannot be
++applied (a missing preset, or a printer that no longer matches after the project's printer
++changed), `apply()` keeps the project's config and remembers the reason, and
++`BackgroundSlicingProcess::validate()` reports it as the plate's slicing error.
++
++`Print::is_BBL_printer()` follows the printer the plate is sliced for.
++
++## Plate layout
++
++Each plate is drawn and checked with its own bed: `PartPlateList::refresh_plate_beds()`
++resolves each plate's printer into a `PlateBed` (printable area, excluded areas, extruder areas,
++printable height, clearances) and `shape_plate()` / `place_plate()` give the plate that shape
++and size instead of the project's. Object containment, the "outside the plate" state,
++arrangement of a single plate and the printable height checks read the plate's own bed.
++
++Plates sit on a grid whose stride is the plate size plus a gap. With every plate on the
++project's bed the stride is the project's plate size, exactly as without the feature. When a
++plate has its own bed, the grid cell becomes the extents of every bed on the grid (the
++project's included), so beds of different sizes or origins never overlap. Changing the cell
++moves each plate, with its objects, to its new place; a bed that changes size re-centers the
++plate's objects, as a printer change does.
++
++`refresh_plate_beds()` runs when a plate's presets change, when the project's bed changes
++(from `set_shapes()`), after a project is loaded and after undo/redo. In the last two the
++objects are already where the saved layout put them, so the plates are moved without them.
++
++## Limitations
++
++- The 3D bed model and axes, the printer logo and the bed type textures belong to the project's
++  printer, and are not drawn on a plate with its own printer.
++- "Arrange all" lays out objects on the project's bed for every plate; arrange a plate with its
++  own printer from its plate toolbar.
++- Device features (sending, printing, AMS mapping, the physical printer) use the project's
++  printer.
++- The command line ignores per-plate presets and slices every plate with the project's presets.
+diff --git a/localization/i18n/list.txt b/localization/i18n/list.txt
+index b5c2f0e8..b6404570 100644
+--- a/localization/i18n/list.txt
++++ b/localization/i18n/list.txt
+@@ -308,6 +308,7 @@ src/slic3r/GUI/PrinterCloudAuthDialog.cpp
+ src/slic3r/GUI/PrinterWebViewHandler.cpp
+ src/slic3r/GUI/AMSDryControl.cpp
+ src/slic3r/GUI/AMSDryControl.hpp
++src/libslic3r/PlatePresetOverride.cpp
+ src/libslic3r/PresetBundle.cpp
+ src/slic3r/GUI/CAD/DesignPanel.cpp
+ src/slic3r/GUI/CAD/DesignSketchTool.cpp
+diff --git a/src/libslic3r/CMakeLists.txt b/src/libslic3r/CMakeLists.txt
+index a81d0843..85f8dfdb 100644
+--- a/src/libslic3r/CMakeLists.txt
++++ b/src/libslic3r/CMakeLists.txt
+@@ -418,6 +418,8 @@ set(lisbslic3r_sources
+     PolygonTrimmer.hpp
+     Polyline.cpp
+     Polyline.hpp
++    PlatePresetOverride.cpp
++    PlatePresetOverride.hpp
+     PresetBundle.cpp
+     PresetBundle.hpp
+     PrinterBedAssets.hpp
+diff --git a/src/libslic3r/Format/bbs_3mf.cpp b/src/libslic3r/Format/bbs_3mf.cpp
+index 9513a1e8..6cd6f2ab 100644
+--- a/src/libslic3r/Format/bbs_3mf.cpp
++++ b/src/libslic3r/Format/bbs_3mf.cpp
+@@ -407,6 +407,10 @@ static constexpr const char* INSTANCEID_ATTR = "instance_id";
+ static constexpr const char* IDENTIFYID_ATTR = "identify_id";
+ static constexpr const char* PLATERID_ATTR = "plater_id";
+ static constexpr const char* PLATER_NAME_ATTR = "plater_name";
++// Orca: per-plate printer / process presets. Older versions ignore these keys and slice the plate
++// with the project's presets.
++static constexpr const char* PLATE_PRINTER_PRESET_ATTR = "orca_printer_preset";
++static constexpr const char* PLATE_PROCESS_PRESET_ATTR = "orca_process_preset";
+ static constexpr const char* PLATE_IDX_ATTR = "index";
+ static constexpr const char* PRINTER_MODEL_ID_ATTR = "printer_model_id";
+ static constexpr const char* EXTRUDER_TYPE_ATTR = "extruder_type";
+@@ -2453,6 +2457,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
+             plate_data_list[it->first-1]->locked = it->second->locked;
+             plate_data_list[it->first-1]->plate_index = it->second->plate_index-1;
+             plate_data_list[it->first-1]->plate_name = it->second->plate_name;
++            plate_data_list[it->first-1]->printer_preset_override = it->second->printer_preset_override;
++            plate_data_list[it->first-1]->process_preset_override = it->second->process_preset_override;
+             plate_data_list[it->first-1]->obj_inst_map = it->second->obj_inst_map;
+             plate_data_list[it->first-1]->gcode_file = (m_load_restore || it->second->gcode_file.empty()) ? it->second->gcode_file : m_backup_path + "/" + it->second->gcode_file;
+             plate_data_list[it->first-1]->gcode_prediction = it->second->gcode_prediction;
+@@ -4653,6 +4659,12 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
+             else if (key == PLATER_NAME_ATTR) {
+                 m_curr_plater->plate_name = xml_unescape(value.c_str());
+             }
++            else if (key == PLATE_PRINTER_PRESET_ATTR) {
++                m_curr_plater->printer_preset_override = xml_unescape(value.c_str());
++            }
++            else if (key == PLATE_PROCESS_PRESET_ATTR) {
++                m_curr_plater->process_preset_override = xml_unescape(value.c_str());
++            }
+             else if (key == LOCK_ATTR)
+             {
+                 std::istringstream(value) >> std::boolalpha >> m_curr_plater->locked;
+@@ -8522,6 +8534,10 @@ bool _BBS_3MF_Exporter::_add_model_config_file_to_archive(mz_zip_archive& archiv
+                 //plate index
+                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATERID_ATTR << "\" " << VALUE_ATTR << "=\"" << plate_data->plate_index + 1 << "\"/>\n";
+                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_NAME_ATTR << "\" " << VALUE_ATTR << "=\"" <<  xml_escape(plate_data->plate_name.c_str()) << "\"/>\n";
++                if (!plate_data->printer_preset_override.empty())
++                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATE_PRINTER_PRESET_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(plate_data->printer_preset_override) << "\"/>\n";
++                if (!plate_data->process_preset_override.empty())
++                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATE_PROCESS_PRESET_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(plate_data->process_preset_override) << "\"/>\n";
+                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << LOCK_ATTR << "\" " << VALUE_ATTR << "=\"" << std::boolalpha<< plate_data->locked<< "\"/>\n";
+                 ConfigOption* bed_type_opt = plate_data->config.option("curr_bed_type");
+                 t_config_enum_names bed_type_names = ConfigOptionEnum<BedType>::get_enum_names();
+diff --git a/src/libslic3r/Format/bbs_3mf.hpp b/src/libslic3r/Format/bbs_3mf.hpp
+index ca181932..a23441e8 100644
+--- a/src/libslic3r/Format/bbs_3mf.hpp
++++ b/src/libslic3r/Format/bbs_3mf.hpp
+@@ -117,6 +117,9 @@ struct PlateData
+     std::string     gcode_weight;
+     std::string     first_layer_time;
+     std::string     plate_name;
++    // Orca: the printer / process presets the plate uses instead of the project's (empty: the project's).
++    std::string     printer_preset_override;
++    std::string     process_preset_override;
+     std::vector<FilamentInfo> slice_filaments_info;
+     // Mixed (virtual) filaments used by this plate; empty when no mixed filament is used.
+     std::vector<PlateMixedFilamentInfo> mixed_filaments_info;
+diff --git a/src/libslic3r/PlatePresetOverride.cpp b/src/libslic3r/PlatePresetOverride.cpp
+new file mode 100644
+index 00000000..72f8e320
+--- /dev/null
++++ b/src/libslic3r/PlatePresetOverride.cpp
+@@ -0,0 +1,149 @@
++#include "PlatePresetOverride.hpp"
++
++#include <set>
++#include <string>
++#include <vector>
++
++#include "Config.hpp"
++#include "I18N.hpp"
++#include "Preset.hpp"
++#include "PresetBundle.hpp"
++#include "PrintConfig.hpp"
++#include "format.hpp"
++
++namespace Slic3r {
++
++namespace {
++
++const std::set<std::string> &printer_keys()
++{
++    static const std::set<std::string> keys(Preset::printer_options().begin(), Preset::printer_options().end());
++    return keys;
++}
++
++const std::set<std::string> &filament_keys()
++{
++    static const std::set<std::string> keys(Preset::filament_options().begin(), Preset::filament_options().end());
++    return keys;
++}
++
++size_t nozzle_count(const DynamicPrintConfig &config)
++{
++    const auto *nozzles = config.option<ConfigOptionFloats>("nozzle_diameter");
++    return nozzles == nullptr || nozzles->values.empty() ? 1 : nozzles->values.size();
++}
++
++std::vector<std::string> extruder_variants(const DynamicPrintConfig &config)
++{
++    const auto *variants = config.option<ConfigOptionStrings>("printer_extruder_variant");
++    return variants == nullptr ? std::vector<std::string>() : variants->values;
++}
++
++// Copies the keys of `src` listed in `keys` into `dst`, except the ones `skip` rejects.
++template<class Skip> void overlay(DynamicPrintConfig &dst, const DynamicPrintConfig &src, const std::vector<std::string> &keys, Skip skip)
++{
++    for (const std::string &key : keys) {
++        if (skip(key))
++            continue;
++        if (const ConfigOption *opt = src.option(key); opt != nullptr)
++            dst.set_key_value(key, opt->clone());
++    }
++}
++
++} // namespace
++
++const Preset *find_plate_printer_preset(const PresetBundle &bundle, const std::string &name)
++{
++    return name.empty() ? nullptr : bundle.printers.find_preset(name, false);
++}
++
++const Preset *find_plate_process_preset(const PresetBundle &bundle, const std::string &name)
++{
++    return name.empty() ? nullptr : bundle.prints.find_preset(name, false);
++}
++
++PlatePresetOverrideStatus check_plate_preset_override(const PresetBundle       &bundle,
++                                                      const PlatePresetOverride &override_,
++                                                      const DynamicPrintConfig &project_full_config)
++{
++    if (override_.empty())
++        return PlatePresetOverrideStatus::None;
++
++    if (!override_.printer.empty()) {
++        const Preset *printer = find_plate_printer_preset(bundle, override_.printer);
++        if (printer == nullptr)
++            return PlatePresetOverrideStatus::PrinterNotFound;
++        if (printer->printer_technology() != ptFFF)
++            return PlatePresetOverrideStatus::TechnologyMismatch;
++        const size_t extruders = nozzle_count(project_full_config);
++        if (nozzle_count(printer->config) != extruders)
++            return PlatePresetOverrideStatus::ExtruderCountMismatch;
++        if (extruders > 1 && extruder_variants(printer->config) != extruder_variants(project_full_config))
++            return PlatePresetOverrideStatus::ExtruderVariantMismatch;
++    }
++    if (!override_.process.empty() && find_plate_process_preset(bundle, override_.process) == nullptr)
++        return PlatePresetOverrideStatus::ProcessNotFound;
++    return PlatePresetOverrideStatus::Ok;
++}
++
++PlatePresetOverrideStatus apply_plate_preset_override(const PresetBundle       &bundle,
++                                                      const PlatePresetOverride &override_,
++                                                      DynamicPrintConfig       &full_config)
++{
++    const PlatePresetOverrideStatus status = check_plate_preset_override(bundle, override_, full_config);
++    if (status != PlatePresetOverrideStatus::Ok)
++        return status;
++
++    // project_config holds exactly the project-level keys; they keep the project's values.
++    auto is_project_key = [&bundle](const std::string &key) { return bundle.project_config.has(key); };
++
++    if (const Preset *process = find_plate_process_preset(bundle, override_.process); process != nullptr) {
++        overlay(full_config, process->config, Preset::print_options(), [&](const std::string &key) {
++            return is_project_key(key) || printer_keys().count(key) != 0 || filament_keys().count(key) != 0;
++        });
++        full_config.set_key_value("print_settings_id", new ConfigOptionString(process->name));
++    }
++
++    if (const Preset *printer = find_plate_printer_preset(bundle, override_.printer); printer != nullptr) {
++        overlay(full_config, printer->config, Preset::printer_options(), is_project_key);
++        full_config.set_key_value("printer_settings_id", new ConfigOptionString(printer->name));
++    }
++    return status;
++}
++
++std::string plate_preset_override_error(PlatePresetOverrideStatus status, const PlatePresetOverride &override_)
++{
++    switch (status) {
++    case PlatePresetOverrideStatus::PrinterNotFound:
++        // TRN %1% is the name of a printer preset assigned to a plate.
++        return format(_u8L("The printer preset \"%1%\" assigned to this plate was not found. Choose another printer in the plate settings."), override_.printer);
++    case PlatePresetOverrideStatus::ProcessNotFound:
++        // TRN %1% is the name of a process preset assigned to a plate.
++        return format(_u8L("The process preset \"%1%\" assigned to this plate was not found. Choose another process in the plate settings."), override_.process);
++    case PlatePresetOverrideStatus::TechnologyMismatch:
++        // TRN %1% is the name of a printer preset assigned to a plate.
++        return format(_u8L("The printer \"%1%\" assigned to this plate is not an FFF printer."), override_.printer);
++    case PlatePresetOverrideStatus::ExtruderCountMismatch:
++        // TRN %1% is the name of a printer preset assigned to a plate.
++        return format(_u8L("The printer \"%1%\" assigned to this plate has a different number of extruders than the project's printer."), override_.printer);
++    case PlatePresetOverrideStatus::ExtruderVariantMismatch:
++        // TRN %1% is the name of a printer preset assigned to a plate.
++        return format(_u8L("The printer \"%1%\" assigned to this plate has different extruder types than the project's printer."), override_.printer);
++    case PlatePresetOverrideStatus::None:
++    case PlatePresetOverrideStatus::Ok: break;
++    }
++    return {};
++}
++
++bool is_bbl_printer_model(const PresetBundle &bundle, const std::string &printer_model)
++{
++    if (printer_model.empty())
++        return false;
++    for (const auto &[vendor_name, vendor_profile] : bundle.vendors)
++        for (const auto &model : vendor_profile.models)
++            if (model.name == printer_model)
++                return vendor_name == "BBL";
++    return false;
++}
++
++} // namespace Slic3r
+diff --git a/src/libslic3r/PlatePresetOverride.hpp b/src/libslic3r/PlatePresetOverride.hpp
+new file mode 100644
+index 00000000..e4e075e2
+--- /dev/null
++++ b/src/libslic3r/PlatePresetOverride.hpp
+@@ -0,0 +1,75 @@
++#pragma once
++
++// Per-plate printer / process presets ("multi-printer plates").
++//
++// A project normally slices every plate with the printer and process presets selected in the
++// sidebar. A plate may instead name its own printer preset, and optionally its own process
++// preset, so that one project can hold plates for different machines. The plate is then laid
++// out with that printer's bed and sliced with that printer's settings.
++//
++// The override is applied on top of the project's full config (PresetBundle::full_config()),
++// exactly where the plate's own settings are applied today. Filaments, the project config and
++// the plate settings stay shared with the rest of the project. Because the per-filament and
++// per-extruder vectors in the full config are sized for the project's printer, an override
++// printer must use the same printer technology and the same number of extruders (and, for
++// multi-extruder printers, the same extruder variants) as the project's printer.
++
++#include <string>
++
++namespace Slic3r {
++
++class DynamicPrintConfig;
++class Preset;
++class PresetBundle;
++
++struct PlatePresetOverride
++{
++    // Name of the printer preset the plate uses. Empty means "the project's printer".
++    std::string printer;
++    // Name of the process preset the plate uses. Empty means "the project's process".
++    // A process override without a printer override is allowed.
++    std::string process;
++
++    bool empty() const { return printer.empty() && process.empty(); }
++    bool operator==(const PlatePresetOverride &rhs) const { return printer == rhs.printer && process == rhs.process; }
++    bool operator!=(const PlatePresetOverride &rhs) const { return !(*this == rhs); }
++};
++
++enum class PlatePresetOverrideStatus
++{
++    None,                   // the plate has no override
++    Ok,                     // the override resolves and can be applied
++    PrinterNotFound,        // no printer preset with that name
++    ProcessNotFound,        // no process preset with that name
++    TechnologyMismatch,     // the printer is not an FFF printer like the project's printer
++    ExtruderCountMismatch,  // the printer has a different number of extruders
++    ExtruderVariantMismatch // a multi-extruder printer with different extruder variants
++};
++
++// The printer preset a plate override names, or nullptr. The edited copy is returned for the
++// currently selected printer, so unsaved edits are honoured.
++const Preset *find_plate_printer_preset(const PresetBundle &bundle, const std::string &name);
++// The process preset a plate override names, or nullptr.
++const Preset *find_plate_process_preset(const PresetBundle &bundle, const std::string &name);
++
++// Whether `override_` can be applied on top of `project_full_config`, the project's full config.
++PlatePresetOverrideStatus check_plate_preset_override(const PresetBundle       &bundle,
++                                                      const PlatePresetOverride &override_,
++                                                      const DynamicPrintConfig &project_full_config);
++
++// Overlays the override's printer and process settings onto `full_config`, the project's full
++// config, and returns the check result. `full_config` is changed only when the result is Ok.
++// Precedence follows PresetBundle::full_fff_config(): process < filament < printer < project, so
++// project-level keys are never replaced and a process override does not replace filament or
++// printer keys.
++PlatePresetOverrideStatus apply_plate_preset_override(const PresetBundle       &bundle,
++                                                      const PlatePresetOverride &override_,
++                                                      DynamicPrintConfig       &full_config);
++
++// A user-facing message for a failed check, naming the preset. Empty for None and Ok.
++std::string plate_preset_override_error(PlatePresetOverrideStatus status, const PlatePresetOverride &override_);
++
++// True when `printer_model` belongs to the BBL vendor bundle (see PresetBundle::is_bbl_vendor()).
++bool is_bbl_printer_model(const PresetBundle &bundle, const std::string &printer_model);
++
++} // namespace Slic3r
+diff --git a/src/slic3r/GUI/3DScene.cpp b/src/slic3r/GUI/3DScene.cpp
+index d76c8fd4..6c00a580 100644
+--- a/src/slic3r/GUI/3DScene.cpp
++++ b/src/slic3r/GUI/3DScene.cpp
+@@ -1321,7 +1321,9 @@ bool GLVolumeCollection::check_outside_state(const BuildVolume &build_volume, Mo
+ 
+     GUI::PartPlate* curr_plate = GUI::wxGetApp().plater()->get_partplate_list().get_selected_plate();
+     const Pointfs& pp_bed_shape = curr_plate->get_shape();
+-    BuildVolume plate_build_volume(pp_bed_shape, build_volume.printable_height(), build_volume.extruder_areas(), build_volume.extruder_heights());
++    // Orca: a plate with its own printer has that printer's height.
++    const double plate_height = curr_plate->has_printer_override() ? curr_plate->get_printable_height() : build_volume.printable_height();
++    BuildVolume plate_build_volume(pp_bed_shape, plate_height, build_volume.extruder_areas(), build_volume.extruder_heights());
+     const std::vector<BoundingBoxf3>& exclude_areas = curr_plate->get_exclude_areas();
+ 
+     const DynamicPrintConfig *plater_config = GUI::wxGetApp().plater()->config();
+diff --git a/src/slic3r/GUI/BackgroundSlicingProcess.cpp b/src/slic3r/GUI/BackgroundSlicingProcess.cpp
+index d9d716a6..4b858314 100644
+--- a/src/slic3r/GUI/BackgroundSlicingProcess.cpp
++++ b/src/slic3r/GUI/BackgroundSlicingProcess.cpp
+@@ -3,6 +3,9 @@
+ #include "GUI.hpp"
+ #include "MainFrame.hpp"
+ #include "format.hpp"
++#include "PartPlate.hpp"
++#include "libslic3r/PlatePresetOverride.hpp"
++#include "libslic3r/PresetBundle.hpp"
+ 
+ #include <cstddef>
+ #include <exception>
+@@ -224,7 +227,7 @@ void BackgroundSlicingProcess::process_fff()
+ {
+     assert(m_print == m_fff_print);
+     PresetBundle& preset_bundle   = *GUI::wxGetApp().preset_bundle;
+-    m_fff_print->is_BBL_printer() = preset_bundle.is_bbl_vendor();
++    m_fff_print->is_BBL_printer() = current_printer_is_bbl();
+     // BBS: add the logic to process from an existed gcode file
+     if (m_print->finished()) {
+         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: skip slicing, to process previous gcode file") % __LINE__;
+@@ -740,18 +743,37 @@ StringObjectException BackgroundSlicingProcess::validate(std::vector<StringObjec
+     assert(m_print != nullptr);
+     assert(m_print == m_fff_print);
+ 
+-    m_fff_print->is_BBL_printer() = GUI::wxGetApp().preset_bundle->is_bbl_vendor();
++    if (!m_plate_preset_error.empty()) {
++        StringObjectException err;
++        err.string = m_plate_preset_error;
++        return err;
++    }
++    m_fff_print->is_BBL_printer() = current_printer_is_bbl();
+     return m_print->validate(warnings, collison_polygons, height_polygons);
+ }
+ 
++bool BackgroundSlicingProcess::current_printer_is_bbl() const
++{
++    PresetBundle &bundle = *GUI::wxGetApp().preset_bundle;
++    if (m_current_plate != nullptr && m_current_plate->has_printer_override() && m_plate_preset_error.empty())
++        if (const Preset *printer = find_plate_printer_preset(bundle, m_current_plate->preset_override().printer))
++            return is_bbl_printer_model(bundle, printer->config.opt_string("printer_model"));
++    return bundle.is_bbl_vendor();
++}
++
+ // Apply config over the print. Returns false, if the new config values caused any of the already
+ // processed steps to be invalidated, therefore the task will need to be restarted.
+ Print::ApplyStatus BackgroundSlicingProcess::apply(const Model& model, const DynamicPrintConfig& config)
+ {
+     assert(m_print != nullptr);
+     assert(config.opt_enum<PrinterTechnology>("printer_technology") == m_print->technology());
+-    // TODO: add partplate config
+     DynamicPrintConfig new_config = config;
++    // Orca: a plate with its own printer / process presets is sliced with them.
++    m_plate_preset_error.clear();
++    if (const PlatePresetOverride &preset_override = m_current_plate->preset_override(); !preset_override.empty()) {
++        const PlatePresetOverrideStatus status = apply_plate_preset_override(*GUI::wxGetApp().preset_bundle, preset_override, new_config);
++        m_plate_preset_error = plate_preset_override_error(status, preset_override);
++    }
+     new_config.apply(*m_current_plate->config());
+     Print::ApplyStatus invalidated = m_print->apply(model, new_config);
+ 
+diff --git a/src/slic3r/GUI/BackgroundSlicingProcess.hpp b/src/slic3r/GUI/BackgroundSlicingProcess.hpp
+index b1375b67..6b66a87b 100644
+--- a/src/slic3r/GUI/BackgroundSlicingProcess.hpp
++++ b/src/slic3r/GUI/BackgroundSlicingProcess.hpp
+@@ -294,6 +294,11 @@ private:
+ 
+ 	//BBS: partplate related
+ 	GUI::PartPlate* m_current_plate;
++	// Orca: why the current plate's own printer / process presets could not be applied by the last
++	// apply(); validate() reports it. Empty when they applied or the plate has none.
++	std::string     m_plate_preset_error;
++	// Orca: whether the printer the current plate is sliced for is a BBL printer.
++	bool            current_printer_is_bbl() const;
+ 	PrinterTechnology m_printer_tech = ptUnknown;
+ 	bool m_internal_cancelled = false;
+ 
+diff --git a/src/slic3r/GUI/GLCanvas3D.cpp b/src/slic3r/GUI/GLCanvas3D.cpp
+index 4348933a..86dae0cd 100644
+--- a/src/slic3r/GUI/GLCanvas3D.cpp
++++ b/src/slic3r/GUI/GLCanvas3D.cpp
+@@ -9746,6 +9746,9 @@ void GLCanvas3D::_render_bed(const Transform3d& view_matrix, const Transform3d&
+     } else {
+         // With the other plates hidden, the axes go to the current plate as in Preview.
+         m_bed.set_axes_mode(m_main_toolbar.is_enabled() && !_hides_inactive_plates());
++        // Orca: the bed model is the project's printer's; a plate with its own printer draws only its plate.
++        if (const PartPlate* plate = wxGetApp().plater()->get_partplate_list().get_curr_plate(); plate != nullptr && plate->has_printer_override())
++            return;
+     }
+     m_bed.render(*this, view_matrix, projection_matrix, bottom, scale_factor, show_axes);
+ }
+diff --git a/src/slic3r/GUI/Jobs/ArrangeJob.cpp b/src/slic3r/GUI/Jobs/ArrangeJob.cpp
+index b78ca6f8..a68fbad5 100644
+--- a/src/slic3r/GUI/Jobs/ArrangeJob.cpp
++++ b/src/slic3r/GUI/Jobs/ArrangeJob.cpp
+@@ -787,6 +787,13 @@ void ArrangeJob::process(Ctl &ctl)
+     update_arrange_items(m_selected, m_unselected, m_plater->config(), params);
+ 
+     Points      bedpts = get_shrink_bedpts(m_plater->config(),params);
++    // Orca: a plate with its own printer is arranged on that printer's bed.
++    if (only_on_partplate)
++        if (const std::optional<PlateBed>& plate_bed = partplate_list.get_curr_plate()->override_bed()) {
++            DynamicPrintConfig plate_bed_config;
++            plate_bed_config.set_key_value("printable_area", new ConfigOptionPoints(plate_bed->shape));
++            bedpts = get_shrink_bedpts(&plate_bed_config, params);
++        }
+ 
+     // Keep the parts on IDEX/IQEX plates in their primary zones; see ImexArranger.
+     const ImexArranger imex(m_imex, params, bedpts);
+diff --git a/src/slic3r/GUI/PartPlate.cpp b/src/slic3r/GUI/PartPlate.cpp
+index de2cb320..18f04365 100644
+--- a/src/slic3r/GUI/PartPlate.cpp
++++ b/src/slic3r/GUI/PartPlate.cpp
+@@ -1860,6 +1860,10 @@ void PartPlate::render_logo_texture(GLTexture &logo_texture, GLModel& logo_buffe
+ 
+ void PartPlate::render_logo(bool bottom, bool render_cali)
+ {
++	// Orca: the logo and bed-type textures belong to the project's printer, not to this plate's own.
++	if (has_printer_override())
++		return;
++
+ 	if (!m_partplate_list->render_bedtype_logo) {
+ 		// render third-party printer texture logo
+ 		if (!m_partplate_list->load_logo_texture())
+@@ -2667,14 +2671,18 @@ void PartPlate::render_icons(bool bottom, bool only_name, int hover_id)
+             }
+ 
+ 			if (m_partplate_list->render_plate_settings) {
+-				bool has_plate_settings = get_bed_type() != BedType::btDefault || get_print_seq() != PrintSequence::ByDefault || !get_first_layer_print_sequence().empty() || !get_other_layers_print_sequence().empty() || has_spiral_mode_config();
++				bool has_plate_settings = get_bed_type() != BedType::btDefault || get_print_seq() != PrintSequence::ByDefault || !get_first_layer_print_sequence().empty() || !get_other_layers_print_sequence().empty() || has_spiral_mode_config() || !m_preset_override.empty();
+                 if (hover_id == 5) {
+                     if (!has_plate_settings)
+                         render_icon_texture(m_plate_settings_icon.model, m_partplate_list->m_plate_settings_hovered_texture);
+                     else
+                         render_icon_texture(m_plate_settings_icon.model, m_partplate_list->m_plate_settings_changed_hovered_texture);
+ 
+-                    set_hover_tooltip(_u8L("Customize current plate"));
++                    if (has_printer_override())
++                        // TRN Tooltip of the plate settings icon. %1% is the printer preset the plate uses.
++                        set_hover_tooltip(format(_u8L("Customize current plate (printer: %1%)"), m_preset_override.printer));
++                    else
++                        set_hover_tooltip(_u8L("Customize current plate"));
+                 } else {
+                     if (!has_plate_settings)
+                         render_icon_texture(m_plate_settings_icon.model, m_partplate_list->m_plate_settings_texture);
+@@ -4348,6 +4356,38 @@ void PartPlate::sync_plate_name_to_print()
+     m_print->set_plate_name(m_name);
+ }
+ 
++PlateBed PlateBed::from_printer_config(const DynamicPrintConfig& printer_config)
++{
++    PlateBed bed;
++    if (const auto* area = printer_config.option<ConfigOptionPoints>("printable_area"))
++        bed.shape = make_counter_clockwise(area->values);
++    if (const auto* exclude = printer_config.option<ConfigOptionPoints>("bed_exclude_area"))
++        bed.exclude_areas = exclude->values;
++    if (const auto* areas = printer_config.option<ConfigOptionPointsGroups>("extruder_printable_area"))
++        bed.extruder_areas = areas->values;
++    if (const auto* heights = printer_config.option<ConfigOptionFloatsNullable>("extruder_printable_height"))
++        bed.extruder_heights = heights->values;
++    if (const auto* height = printer_config.option<ConfigOptionFloat>("printable_height"))
++        bed.printable_height = height->value;
++    if (const auto* lid = printer_config.option<ConfigOptionFloat>("extruder_clearance_height_to_lid"))
++        bed.height_to_lid = float(lid->value);
++    if (const auto* rod = printer_config.option<ConfigOptionFloat>("extruder_clearance_height_to_rod"))
++        bed.height_to_rod = float(rod->value);
++    if (!bed.shape.empty())
++        bed.extents = get_extents(bed.shape);
++    bed.width = int(bed.extents.size().x());
++    bed.depth = int(bed.extents.size().y());
++    return bed;
++}
++
++void PartPlate::set_preset_override(const PlatePresetOverride& preset_override)
++{
++    if (m_preset_override == preset_override)
++        return;
++    m_preset_override = preset_override;
++    update_slice_result_valid_state(false);
++}
++
+ void PartPlate::set_plate_name(const std::string& name) 
+ { 
+ 	// compare if name equal to m_name, case sensitive
+@@ -6517,7 +6557,7 @@ void PartPlateList::reinit()
+ 
+ 	//reset plate 0's position
+ 	Vec2d pos = compute_shape_position(0, m_plate_cols);
+-	m_plate_list[0]->set_shape(m_shape, m_exclude_areas, m_extruder_areas, m_extruder_heights, pos, m_height_to_lid, m_height_to_rod);
++	shape_plate(m_plate_list[0], pos);
+ 	//reset unprintable plate's position
+ 	Vec3d origin2 = compute_origin_for_unprintable();
+ 	unprintable_plate.set_pos_and_size(origin2, m_plate_width, m_plate_depth, m_plate_height, false);
+@@ -6608,7 +6648,7 @@ int PartPlateList::create_plate(bool adjust_position)
+ 
+ 	plate->set_index(new_index);
+ 	Vec2d pos = compute_shape_position(new_index, cols);
+-	plate->set_shape(m_shape, m_exclude_areas, m_extruder_areas, m_extruder_heights, pos, m_height_to_lid, m_height_to_rod);
++	shape_plate(plate, pos);
+ 	m_plate_list.emplace_back(plate);
+ 	update_plate_cols();
+ 	if (old_cols != cols)
+@@ -6671,6 +6711,12 @@ int PartPlateList::duplicate_plate(int index)
+     old_plate = get_plate(index);
+     new_plate = get_plate(new_plate_index);
+ 
++    // Orca: the copy prints on the same printer as the original.
++    if (!old_plate->preset_override().empty()) {
++        new_plate->set_preset_override(old_plate->preset_override());
++        refresh_plate_beds();
++    }
++
+     // get the offset between plate centers
+     Vec3d plate_to_plate_offset = new_plate->m_origin - old_plate->m_origin;
+ 
+@@ -6785,7 +6831,7 @@ int PartPlateList::delete_plate(int index)
+ 	//move this plate's instance to the end
+ 	Vec3d current_origin;
+ 	current_origin = compute_origin_for_unprintable();
+-	plate->set_pos_and_size(current_origin, m_plate_width, m_plate_depth, m_plate_height, true);
++	place_plate(plate, current_origin, true);
+ 
+ 	//update the plates after it
+ 	for (unsigned int i = index; i < (unsigned int)m_plate_list.size(); ++i)
+@@ -6795,11 +6841,11 @@ int PartPlateList::delete_plate(int index)
+ 
+ 		plate->set_index(i);
+ 		Vec3d origin = compute_origin(i, m_plate_cols);
+-		plate->set_pos_and_size(origin, m_plate_width, m_plate_depth, m_plate_height, true);
++		place_plate(plate, origin, true);
+ 
+ 		//update render shapes
+ 		Vec2d pos = compute_shape_position(i, m_plate_cols);
+-		plate->set_shape(m_shape, m_exclude_areas, m_extruder_areas, m_extruder_heights, pos, m_height_to_lid, m_height_to_rod);
++		shape_plate(plate, pos);
+ 	}
+ 
+ 	//update current_plate if delete current
+@@ -7047,7 +7093,7 @@ double PartPlateList::plate_stride_x()
+ 	//const auto plate_shape = Slic3r::Polygon::new_scale(m_shape);
+ 	//double plate_width = plate_shape.bounding_box().size().x();
+ 	//return unscaled<double>((1. + LOGICAL_PART_PLATE_GAP) * plate_width);
+-	return m_plate_width * (1. + LOGICAL_PART_PLATE_GAP);
++	return std::max<double>(m_plate_width, m_cell_width) * (1. + LOGICAL_PART_PLATE_GAP);
+ }
+ 
+ double PartPlateList::plate_stride_y()
+@@ -7055,7 +7101,74 @@ double PartPlateList::plate_stride_y()
+ 	//const auto plate_shape = Slic3r::Polygon::new_scale(m_shape);
+ 	//double plate_depth = plate_shape.bounding_box().size().y();
+ 	//return unscaled<double>((1. + LOGICAL_PART_PLATE_GAP) * plate_depth);
+-	return m_plate_depth * (1. + LOGICAL_PART_PLATE_GAP);
++	return std::max<double>(m_plate_depth, m_cell_depth) * (1. + LOGICAL_PART_PLATE_GAP);
++}
++
++void PartPlateList::place_plate(PartPlate* plate, Vec3d origin, bool with_instance_move, bool do_clear)
++{
++	if (const std::optional<PlateBed>& bed = plate->override_bed())
++		plate->set_pos_and_size(origin, bed->width, bed->depth, bed->printable_height, with_instance_move, do_clear);
++	else
++		plate->set_pos_and_size(origin, m_plate_width, m_plate_depth, m_plate_height, with_instance_move, do_clear);
++}
++
++void PartPlateList::shape_plate(PartPlate* plate, const Vec2d& position)
++{
++	if (const std::optional<PlateBed>& bed = plate->override_bed())
++		plate->set_shape(bed->shape, bed->exclude_areas, bed->extruder_areas, bed->extruder_heights, position, bed->height_to_lid, bed->height_to_rod);
++	else
++		plate->set_shape(m_shape, m_exclude_areas, m_extruder_areas, m_extruder_heights, position, m_height_to_lid, m_height_to_rod);
++}
++
++bool PartPlateList::has_plate_printer_overrides() const
++{
++	return std::any_of(m_plate_list.begin(), m_plate_list.end(), [](const PartPlate* plate) { return plate->has_printer_override(); });
++}
++
++void PartPlateList::refresh_plate_beds(bool move_instances)
++{
++	// The printer presets live in the GUI's preset bundle; the CLI has none and keeps the project's bed.
++	const PresetBundle* bundle = m_plater != nullptr ? wxGetApp().preset_bundle : nullptr;
++	if (bundle == nullptr && has_plate_printer_overrides())
++		BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": plates name their own printer presets, which are applied only in the GUI";
++	BoundingBoxf extents = m_shape.empty() ? BoundingBoxf() : get_extents(m_shape);
++	bool any_override = false;
++	for (PartPlate* plate : m_plate_list) {
++		plate->m_override_bed.reset();
++		if (bundle == nullptr || !plate->has_printer_override())
++			continue;
++		if (const Preset* printer = find_plate_printer_preset(*bundle, plate->preset_override().printer)) {
++			PlateBed bed = PlateBed::from_printer_config(printer->config);
++			if (bed.shape.size() < 3 || bed.width <= 0 || bed.depth <= 0)
++				continue;
++			extents.merge(bed.extents);
++			plate->m_override_bed = std::move(bed);
++			any_override = true;
++		}
++	}
++
++	// Without overrides the grid keeps the project's plate size, exactly as before.
++	const double cell_width = any_override ? extents.size().x() : 0.;
++	const double cell_depth = any_override ? extents.size().y() : 0.;
++	const bool   grid_changed = cell_width != m_cell_width || cell_depth != m_cell_depth;
++	m_cell_width = cell_width;
++	m_cell_depth = cell_depth;
++
++	// Move the plates, with their objects, to their new place and size.
++	for (unsigned int i = 0; i < (unsigned int)m_plate_list.size(); ++i)
++		place_plate(m_plate_list[i], compute_origin(i, m_plate_cols), move_instances, false);
++	if (grid_changed) {
++		Vec3d origin = compute_origin_for_unprintable();
++		unprintable_plate.set_pos_and_size(origin, m_plate_width, m_plate_depth, m_plate_height, move_instances);
++	}
++	for (unsigned int i = 0; i < (unsigned int)m_plate_list.size(); ++i)
++		shape_plate(m_plate_list[i], compute_shape_position(i, m_plate_cols));
++	calc_bounding_boxes();
++
++	if (m_plater != nullptr && grid_changed) {
++		Vec2d bed_position = compute_shape_position(m_current_plate, m_plate_cols);
++		m_plater->set_bed_position(bed_position);
++	}
+ }
+ 
+ //get the plate counts, not including the invalid plate
+@@ -7094,7 +7207,7 @@ void PartPlateList::update_all_plates_pos_and_size(bool adjust_position, bool wi
+ 
+ 		//compute origin1 for PartPlate
+ 		origin1 = compute_origin(i, m_plate_cols);
+-		plate->set_pos_and_size(origin1, m_plate_width, m_plate_depth, m_plate_height, adjust_position, do_clear);
++		place_plate(plate, origin1, adjust_position, do_clear);
+ 
+ 		// set default wipe pos when switch plate
+         if (switch_plate_type && m_plater/* && plate->get_used_extruders().size() <= 0*/) {
+@@ -7157,12 +7270,12 @@ int PartPlateList::move_plate_to_index(int old_index, int new_index)
+ 		m_plate_list[i]->set_index(i);
+ 
+ 		origin = compute_origin(i, m_plate_cols);
+-		m_plate_list[i]->set_pos_and_size(origin, m_plate_width, m_plate_depth, m_plate_height, true);
++		place_plate(m_plate_list[i], origin, true);
+ 	}
+ 	origin = compute_origin(new_index, m_plate_cols);
+ 	m_plate_list[new_index] = plate;
+ 	plate->set_index(new_index);
+-	plate->set_pos_and_size(origin, m_plate_width, m_plate_depth, m_plate_height, true);
++	place_plate(plate, origin, true);
+ 
+ 	//update the new plate index
+ 	m_current_plate = new_index;
+@@ -8154,7 +8267,7 @@ bool PartPlateList::set_shapes(const Pointfs              &shape,
+ 		Vec2d pos;
+ 
+ 		pos = compute_shape_position(i, m_plate_cols);
+-		plate->set_shape(shape, exclude_areas, extruder_areas, extruder_heights, pos, height_to_lid, height_to_rod);
++		shape_plate(plate, pos);
+ 	}
+ 	is_load_bedtype_textures = false; //reload textures
+     is_load_extruder_only_area_textures = false; // reload textures
+@@ -8164,6 +8277,10 @@ bool PartPlateList::set_shapes(const Pointfs              &shape,
+ 
+ 	update_logo_texture_filename(texture_filename);
+ 
++	// Orca: the grid fits every plate's bed, the project's one included, so it follows its changes.
++	if (m_cell_width > 0. || has_plate_printer_overrides())
++		refresh_plate_beds();
++
+ 	return true;
+ }
+ 
+@@ -8337,6 +8454,9 @@ int PartPlateList::rebuild_plates_after_deserialize(std::vector<bool>& previous_
+         partplate->printer_technology = this->printer_technology;
+     }
+ 	update_plate_cols();
++	// Orca: the restored plates carry their presets but not their printers' beds; the restored
++	// objects are already where those beds put them.
++	refresh_plate_beds(false);
+ 	update_all_plates_pos_and_size(false, false, false, false);
+ 	set_shapes(m_shape, m_exclude_areas, m_wrapping_exclude_areas, m_extruder_areas, m_extruder_heights, m_logo_texture_filename, m_height_to_lid, m_height_to_rod);
+ 	for (unsigned int i = 0; i < (unsigned int)m_plate_list.size(); ++i)
+@@ -8494,6 +8614,8 @@ int PartPlateList::store_to_3mf_structure(PlateDataPtrs& plate_data_list, bool w
+ 		plate_data_item->locked = m_plate_list[i]->m_locked;
+ 		plate_data_item->plate_index = m_plate_list[i]->m_plate_index;
+ 		plate_data_item->plate_name  = m_plate_list[i]->get_plate_name();
++		plate_data_item->printer_preset_override = m_plate_list[i]->preset_override().printer;
++		plate_data_item->process_preset_override = m_plate_list[i]->preset_override().process;
+ 		BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% before load, width %2%, height %3%, size %4%!")
+ 			%(i+1) %m_plate_list[i]->thumbnail_data.width %m_plate_list[i]->thumbnail_data.height %m_plate_list[i]->thumbnail_data.pixels.size();
+ 		plate_data_item->plate_thumbnail.load_from(m_plate_list[i]->thumbnail_data);
+@@ -8612,6 +8734,7 @@ int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int f
+ 		m_plate_list[index]->m_locked = plate_data_list[i]->locked;
+ 		m_plate_list[index]->config()->apply(plate_data_list[i]->config);
+ 		m_plate_list[index]->set_plate_name(plate_data_list[i]->plate_name);
++		m_plate_list[index]->m_preset_override = { plate_data_list[i]->printer_preset_override, plate_data_list[i]->process_preset_override };
+ 		if (plate_data_list[i]->plate_index != index)
+ 		{
+ 			BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(":plate index %1% seems invalid, skip it")% plate_data_list[i]->plate_index;
+@@ -8747,6 +8870,9 @@ int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int f
+ 		}
+ 
+ 	}
++	// Orca: lay the plates out for their own printers before the objects, saved where that layout
++	// put them, are assigned to the plates.
++	refresh_plate_beds(false);
+ 	print();
+ 	ret = reload_all_objects();
+ 	print();
+@@ -8770,7 +8896,7 @@ int PartPlateList::load_gcode_files()
+ 			//BoundingBoxf3   print_volume = m_plate_list[i]->get_bounding_box(false);
+ 			//print_volume.max(2) = this->m_plate_height;
+ 			//print_volume.min(2) = -1e10;
+-			m_model->update_print_volume_state({m_plate_list[i]->get_shape(), this->m_plate_height, m_plate_list[i]->get_extruder_areas(), m_plate_list[i]->get_extruder_heights() });
++			m_model->update_print_volume_state({m_plate_list[i]->get_shape(), m_plate_list[i]->get_printable_height(), m_plate_list[i]->get_extruder_areas(), m_plate_list[i]->get_extruder_heights() });
+ 
+ 			if (!m_plate_list[i]->load_gcode_from_file(m_plate_list[i]->m_gcode_path_from_3mf))
+ 				ret ++;
+diff --git a/src/slic3r/GUI/PartPlate.hpp b/src/slic3r/GUI/PartPlate.hpp
+index 29c7388d..81f7113a 100644
+--- a/src/slic3r/GUI/PartPlate.hpp
++++ b/src/slic3r/GUI/PartPlate.hpp
+@@ -48,6 +48,7 @@
+ #include "3DBed.hpp"
+ #include "MeshUtils.hpp"
+ #include "libslic3r/ParameterUtils.hpp"
++#include "libslic3r/PlatePresetOverride.hpp"
+ 
+ class GLUquadric;
+ typedef class GLUquadric GLUquadricObject;
+@@ -106,6 +107,25 @@ struct WipeTowerRelocation
+     bool overlaps_objects = false; // no spot on the plate was clear of the objects, so it sits on one
+ };
+ 
++// Orca: the bed of a plate that uses its own printer preset (see libslic3r/PlatePresetOverride.hpp),
++// in that printer's bed coordinates. Plates without a printer of their own use the project's bed.
++struct PlateBed
++{
++    Pointfs              shape;
++    Pointfs              exclude_areas;
++    std::vector<Pointfs> extruder_areas;
++    std::vector<double>  extruder_heights;
++    double               printable_height { 0. };
++    int                  width { 0 };
++    int                  depth { 0 };
++    float                height_to_lid { 0.f };
++    float                height_to_rod { 0.f };
++    // Bounding box of `shape`, used to size the plate grid.
++    BoundingBoxf         extents;
++
++    static PlateBed from_printer_config(const DynamicPrintConfig &printer_config);
++};
++
+ class PartPlate : public ObjectBase
+ {
+ public:
+@@ -225,6 +245,12 @@ private:
+     // BBS
+     DynamicPrintConfig m_config;
+ 
++    // Orca: the printer / process presets this plate uses instead of the project's, and the bed
++    // of that printer (resolved by PartPlateList::refresh_plate_beds(); empty without a printer
++    // override, or when the printer preset cannot be resolved).
++    PlatePresetOverride     m_preset_override;
++    std::optional<PlateBed> m_override_bed;
++
+     // SoftFever
+     // part plate name
+     std::string m_name;
+@@ -355,6 +381,15 @@ public:
+ 
+     DynamicPrintConfig* config() { return &m_config; }
+ 
++    // Orca: per-plate printer / process presets. Changing them invalidates the slice result;
++    // the caller refreshes the plate layout with PartPlateList::refresh_plate_beds().
++    const PlatePresetOverride& preset_override() const { return m_preset_override; }
++    void set_preset_override(const PlatePresetOverride& preset_override);
++    bool has_printer_override() const { return !m_preset_override.printer.empty(); }
++    // The bed of the plate's own printer, when it has one that resolves.
++    const std::optional<PlateBed>& override_bed() const { return m_override_bed; }
++    double get_printable_height() const { return m_height; }
++
+     // set print sequence per plate
+     //bool print_seq_same_global = true;
+     void set_print_seq(PrintSequence print_seq = PrintSequence::ByDefault);
+@@ -755,7 +790,7 @@ public:
+         std::vector<std::pair<int, int>>	objects_and_instances;
+         std::vector<std::pair<int, int>>	instances_outside;
+ 
+-        ar(m_plate_index, m_name, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config);
++        ar(m_plate_index, m_name, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_preset_override.printer, m_preset_override.process);
+ 
+         for (std::vector<std::pair<int, int>>::iterator it = objects_and_instances.begin(); it != objects_and_instances.end(); ++it)
+             obj_to_instance_set.insert(std::pair(it->first, it->second));
+@@ -775,7 +810,7 @@ public:
+         for (std::set<std::pair<int, int>>::iterator it = obj_to_instance_set.begin(); it != obj_to_instance_set.end(); ++it)
+             objects_and_instances.emplace_back(it->first, it->second);
+ 
+-        ar(m_plate_index, m_name, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config);
++        ar(m_plate_index, m_name, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_preset_override.printer, m_preset_override.process);
+     }
+     /*template<class Archive> void serialize(Archive& ar)
+     {
+@@ -864,6 +899,15 @@ class PartPlateList : public ObjectBase
+     Vec3d compute_origin_for_unprintable();
+     //compute shape position
+     Vec2d compute_shape_position(int index, int cols);
++
++    // Orca: grid cell size when some plate has its own printer: the extents of every bed on the
++    // grid, so differently sized beds never overlap. 0 when every plate uses the project's bed.
++    double m_cell_width { 0. };
++    double m_cell_depth { 0. };
++    // Moves / resizes a plate to `origin` with its own bed size, or the project's.
++    void place_plate(PartPlate* plate, Vec3d origin, bool with_instance_move, bool do_clear = true);
++    // Sets a plate's shape at `position` from its own bed, or the project's.
++    void shape_plate(PartPlate* plate, const Vec2d& position);
+     //generate icon textures
+     void generate_icon_textures();
+     void release_icon_textures();
+@@ -946,6 +990,14 @@ public:
+ 
+     // Pantheon: update plates after moving plate to the front
+     void update_plates();
++
++    // Orca: re-resolves the printer of every plate that has its own (see PartPlate::set_preset_override()),
++    // resizes the plate grid to fit all beds and re-applies the plate shapes. Call after a plate's
++    // presets change, after presets are loaded or edited, and after a project is loaded.
++    // move_instances moves the objects with their plates; a loaded project's objects are already
++    // where the layout puts them.
++    void refresh_plate_beds(bool move_instances = true);
++    bool has_plate_printer_overrides() const;
+     void invalidate_exclusion_volume_previews();
+     void render_exclusion_volume_intersections(const Transform3d &view_matrix, const Transform3d &projection_matrix);
+ 
+diff --git a/src/slic3r/GUI/PlateSettingsDialog.cpp b/src/slic3r/GUI/PlateSettingsDialog.cpp
+index 31b83677..cab8e066 100644
+--- a/src/slic3r/GUI/PlateSettingsDialog.cpp
++++ b/src/slic3r/GUI/PlateSettingsDialog.cpp
+@@ -17,6 +17,7 @@
+ #include <wx/panel.h>
+ #include "slic3r/GUI/wxExtensions.hpp"
+ #include <vector>
++#include "slic3r/GUI/GUI.hpp"
+ #include "slic3r/GUI/GUI_App.hpp"
+ #include "slic3r/GUI/GUI_Utils.hpp"
+ #include <wx/sizer.h>
+@@ -26,6 +27,8 @@
+ #include "libslic3r/FilamentMixer.hpp"
+ #include "slic3r/GUI/Widgets/StateColor.hpp"
+ #include "libslic3r/ParameterUtils.hpp"
++#include "libslic3r/Preset.hpp"
++#include "libslic3r/PresetBundle.hpp"
+ #include <cstddef>
+ 
+ namespace Slic3r { namespace GUI {
+@@ -409,6 +412,41 @@ PlateSettingsDialog::PlateSettingsDialog(wxWindow* parent, const wxString& title
+     top_sizer->Add(plate_name_txt, 0, wxALIGN_CENTER_VERTICAL | wxALIGN_LEFT | wxTOP | wxBOTTOM, FromDIP(5));
+     top_sizer->Add(m_ti_plate_name, 0, wxALIGN_CENTER_VERTICAL | wxALIGN_RIGHT | wxTOP | wxBOTTOM, FromDIP(5));
+ 
++    // Orca: the printer and process this plate is sliced with. Only printers with as many extruders
++    // as the project's printer are offered, as the filaments are shared with the other plates.
++    {
++        const PresetBundle& bundle = *wxGetApp().preset_bundle;
++        const auto* project_nozzles = bundle.printers.get_edited_preset().config.option<ConfigOptionFloats>("nozzle_diameter");
++        const size_t project_extruders = project_nozzles ? project_nozzles->size() : 1;
++
++        m_printer_choice = new ComboBox(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(240), -1), 0, NULL, wxCB_READONLY);
++        m_printer_choice->Append(_L("Same as project printer"));
++        m_printer_names.emplace_back();
++        for (const Preset& printer : bundle.printers) {
++            const auto* nozzles = printer.config.option<ConfigOptionFloats>("nozzle_diameter");
++            if (!printer.is_visible || printer.printer_technology() != ptFFF || (nozzles ? nozzles->size() : 1) != project_extruders)
++                continue;
++            m_printer_choice->Append(from_u8(printer.name));
++            m_printer_names.push_back(printer.name);
++        }
++        m_printer_choice->SetSelection(0);
++        m_printer_choice->Bind(wxEVT_COMBOBOX, [this](wxCommandEvent&) { update_process_choices(selected_name(m_process_choice, m_process_names), false); });
++
++        auto printer_txt = new wxStaticText(this, wxID_ANY, _L("Printer"));
++        printer_txt->SetFont(Label::Body_14);
++        printer_txt->SetToolTip(_L("Slice this plate for another printer. The plate takes that printer's bed shape and size, and is sliced with its settings."));
++        top_sizer->Add(printer_txt, 0, wxALIGN_CENTER_VERTICAL | wxALIGN_LEFT | wxTOP | wxBOTTOM, FromDIP(5));
++        top_sizer->Add(m_printer_choice, 0, wxALIGN_CENTER_VERTICAL | wxALIGN_RIGHT | wxTOP | wxBOTTOM, FromDIP(5));
++
++        m_process_choice = new ComboBox(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(240), -1), 0, NULL, wxCB_READONLY);
++        update_process_choices({}, false);
++        auto process_txt = new wxStaticText(this, wxID_ANY, _L("Process"));
++        process_txt->SetFont(Label::Body_14);
++        process_txt->SetToolTip(_L("Slice this plate with another process preset. Only the presets compatible with the plate's printer are listed."));
++        top_sizer->Add(process_txt, 0, wxALIGN_CENTER_VERTICAL | wxALIGN_LEFT | wxTOP | wxBOTTOM, FromDIP(5));
++        top_sizer->Add(m_process_choice, 0, wxALIGN_CENTER_VERTICAL | wxALIGN_RIGHT | wxTOP | wxBOTTOM, FromDIP(5));
++    }
++
+     m_bed_type_choice = new ComboBox( this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(240),-1), 0, NULL, wxCB_READONLY );
+     auto pm           = wxGetApp().plater()->get_curr_printer_model();
+     if (pm) {
+@@ -626,6 +664,66 @@ void PlateSettingsDialog::sync_other_layers_print_seq(int selection, const std::
+     }
+ }
+ 
++std::string PlateSettingsDialog::selected_name(const ComboBox* choice, const std::vector<std::string>& names) const
++{
++    const int selection = choice != nullptr ? choice->GetSelection() : 0;
++    return selection > 0 && selection < int(names.size()) ? names[selection] : std::string();
++}
++
++void PlateSettingsDialog::update_process_choices(const std::string& selected, bool keep_unlisted)
++{
++    const PresetBundle& bundle       = *wxGetApp().preset_bundle;
++    const std::string   printer_name = selected_name(m_printer_choice, m_printer_names);
++    const Preset*       printer      = printer_name.empty() ? &bundle.printers.get_edited_preset() : find_plate_printer_preset(bundle, printer_name);
++
++    m_process_choice->Clear();
++    m_process_names.clear();
++    m_process_choice->Append(_L("Same as project process"));
++    m_process_names.emplace_back();
++    int selection = 0;
++    if (printer != nullptr) {
++        const PresetWithVendorProfile printer_with_vendor = bundle.printers.get_preset_with_vendor_profile(*printer);
++        for (const Preset& process : bundle.prints) {
++            if (!process.is_visible || !is_compatible_with_printer(bundle.prints.get_preset_with_vendor_profile(process), printer_with_vendor))
++                continue;
++            if (process.name == selected)
++                selection = int(m_process_names.size());
++            m_process_choice->Append(from_u8(process.name));
++            m_process_names.push_back(process.name);
++        }
++    }
++    if (selection == 0 && keep_unlisted && !selected.empty()) {
++        selection = int(m_process_names.size());
++        m_process_choice->Append(from_u8(selected));
++        m_process_names.push_back(selected);
++    }
++    m_process_choice->SetSelection(selection);
++}
++
++void PlateSettingsDialog::sync_preset_override(const PlatePresetOverride& preset_override)
++{
++    if (m_printer_choice == nullptr)
++        return;
++    int printer_selection = 0;
++    auto it = std::find(m_printer_names.begin(), m_printer_names.end(), preset_override.printer);
++    if (it != m_printer_names.end())
++        printer_selection = int(it - m_printer_names.begin());
++    else if (!preset_override.printer.empty()) {
++        // A printer the plate names but which is not offered (missing, or another extruder count)
++        // stays selected, so opening the dialog does not drop the plate's setting.
++        printer_selection = int(m_printer_names.size());
++        m_printer_choice->Append(from_u8(preset_override.printer));
++        m_printer_names.push_back(preset_override.printer);
++    }
++    m_printer_choice->SetSelection(printer_selection);
++    update_process_choices(preset_override.process, true);
++}
++
++PlatePresetOverride PlateSettingsDialog::get_preset_override() const
++{
++    return { selected_name(m_printer_choice, m_printer_names), selected_name(m_process_choice, m_process_names) };
++}
++
+ void PlateSettingsDialog::sync_spiral_mode(bool spiral_mode, bool as_global)
+ {
+     if (m_spiral_mode_choice) {
+diff --git a/src/slic3r/GUI/PlateSettingsDialog.hpp b/src/slic3r/GUI/PlateSettingsDialog.hpp
+index 1f05b58a..ac907bb6 100644
+--- a/src/slic3r/GUI/PlateSettingsDialog.hpp
++++ b/src/slic3r/GUI/PlateSettingsDialog.hpp
+@@ -18,6 +18,8 @@
+ #include <wx/string.h>
+ #include <wx/toplevel.h>
+ #include "libslic3r/PrintConfig.hpp"
++#include "libslic3r/PlatePresetOverride.hpp"
++#include <string>
+ #include <utility>
+ #include "slic3r/GUI/Widgets/TextInput.hpp"
+ #include <wx/colour.h>
+@@ -172,9 +174,17 @@ public:
+         return false;
+     }
+ 
++    // Orca: the printer / process presets the plate uses instead of the project's.
++    void sync_preset_override(const PlatePresetOverride& preset_override);
++    PlatePresetOverride get_preset_override() const;
++
+ protected:
+     void add_layers();
+     void delete_layers();
++    // Lists the process presets compatible with the chosen printer and selects `selected`. With
++    // keep_unlisted, a `selected` that is not compatible is listed too rather than dropped.
++    void update_process_choices(const std::string& selected, bool keep_unlisted);
++    std::string selected_name(const ComboBox* choice, const std::vector<std::string>& names) const;
+ 
+ protected:
+     ComboBox* m_bed_type_choice { nullptr };
+@@ -185,6 +195,11 @@ protected:
+     DragCanvas* m_drag_canvas;
+     OtherLayersSeqPanel* m_other_layers_seq_panel;
+     TextInput *m_ti_plate_name;
++    ComboBox* m_printer_choice { nullptr };
++    ComboBox* m_process_choice { nullptr };
++    // Preset names behind the choices; the first entry, empty, stands for the project's preset.
++    std::vector<std::string> m_printer_names;
++    std::vector<std::string> m_process_names;
+ };
+ 
+ class PlateNameEditDialog : public DPIDialog
+diff --git a/src/slic3r/GUI/Plater.cpp b/src/slic3r/GUI/Plater.cpp
+index 501f4285..cc403e32 100644
+--- a/src/slic3r/GUI/Plater.cpp
++++ b/src/slic3r/GUI/Plater.cpp
+@@ -11563,7 +11563,8 @@ void Plater::priv::update_print_volume_state()
+ {
+     //BBS: use the plate's bounding box instead of the bed's
+     PartPlate* pp = partplate_list.get_curr_plate();
+-    BuildVolume build_volume(pp->get_shape(), this->bed.build_volume().printable_height(), this->bed.build_volume().extruder_areas(), this->bed.build_volume().extruder_heights());
++    const double height = pp->has_printer_override() ? pp->get_printable_height() : this->bed.build_volume().printable_height();
++    BuildVolume build_volume(pp->get_shape(), height, this->bed.build_volume().extruder_areas(), this->bed.build_volume().extruder_heights());
+     this->model.update_print_volume_state(build_volume);
+ }
+ 
+@@ -23750,9 +23751,23 @@ void Plater::open_platesettings_dialog(wxCommandEvent& evt) {
+     }
+ 
+     dlg.sync_spiral_mode(curr_plate->get_spiral_vase_mode(), !curr_plate->has_spiral_mode_config());
++    dlg.sync_preset_override(curr_plate->preset_override());
+ 
+     dlg.Bind(EVT_SET_BED_TYPE_CONFIRM, [this, plate_index, &dlg](wxCommandEvent& e) {
+         PartPlate* curr_plate = p->partplate_list.get_curr_plate();
++
++        // Orca: the plate's own printer / process presets. A new printer resizes the plate, and the
++        // plate grid when the plate's bed no longer fits it, moving the objects with their plates.
++        const PlatePresetOverride preset_override = dlg.get_preset_override();
++        if (preset_override != curr_plate->preset_override()) {
++            take_snapshot("Change plate printer");
++            curr_plate->set_preset_override(preset_override);
++            p->partplate_list.refresh_plate_beds();
++            p->view3D->plates_count_changed();
++            p->update_print_volume_state();
++            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% printer \"%2%\", process \"%3%\"") % plate_index % preset_override.printer % preset_override.process;
++        }
++
+         BedType old_bed_type = curr_plate->get_bed_type();
+         auto bt_sel = dlg.get_bed_type_choice();
+         if (old_bed_type != bt_sel) {
+diff --git a/tests/fff_print/CMakeLists.txt b/tests/fff_print/CMakeLists.txt
+index 9963006f..141ebd21 100644
+--- a/tests/fff_print/CMakeLists.txt
++++ b/tests/fff_print/CMakeLists.txt
+@@ -29,6 +29,7 @@ add_executable(${_TEST_NAME}_tests
+ 	test_perimeters.cpp
+ 	# Seam geometry and pipeline regressions share the existing Print fixtures.
+ 	test_precise_seam.cpp
++	test_plate_preset_override.cpp
+ 	test_print.cpp
+ 	test_printobject.cpp
+ 	test_mixed_filament.cpp
+diff --git a/tests/fff_print/test_plate_preset_override.cpp b/tests/fff_print/test_plate_preset_override.cpp
+new file mode 100644
+index 00000000..4d7e554f
+--- /dev/null
++++ b/tests/fff_print/test_plate_preset_override.cpp
+@@ -0,0 +1,40 @@
++#include <catch2/catch_test_macros.hpp>
++
++#include <string>
++
++#include "libslic3r/Config.hpp"
++#include "libslic3r/PlatePresetOverride.hpp"
++#include "libslic3r/Point.hpp"
++#include "libslic3r/Preset.hpp"
++#include "libslic3r/PresetBundle.hpp"
++#include "libslic3r/PrintConfig.hpp"
++
++#include "test_helpers.hpp"
++
++using namespace Slic3r;
++using namespace Slic3r::Test;
++
++// The per-plate printer reaches the G-code: a plate sliced with the config the plate's printer
++// overrides gets that printer's start G-code, and its bed, not the project's.
++TEST_CASE("A plate with its own printer is sliced with that printer's G-code", "[PlatePresetOverride]")
++{
++    PresetBundle bundle;
++    DynamicPrintConfig &project_printer = bundle.printers.get_edited_preset().config;
++    project_printer.set_key_value("machine_start_gcode", new ConfigOptionString("; PROJECT_PRINTER_START"));
++
++    DynamicPrintConfig other = bundle.printers.default_preset().config;
++    other.set_key_value("machine_start_gcode", new ConfigOptionString("; OTHER_PRINTER_START"));
++    other.set_key_value("printable_area", new ConfigOptionPoints({ { 0., 0. }, { 120., 0. }, { 120., 120. }, { 0., 120. } }));
++    bundle.printers.load_preset(std::string(), "Other Printer", other, false);
++
++    const DynamicPrintConfig project = bundle.full_config();
++    DynamicPrintConfig       plate   = project;
++    REQUIRE(apply_plate_preset_override(bundle, { "Other Printer", {} }, plate) == PlatePresetOverrideStatus::Ok);
++
++    const std::string project_gcode = slice({ cube(20) }, project);
++    const std::string plate_gcode   = slice({ cube(20) }, plate);
++
++    CHECK(project_gcode.find("; PROJECT_PRINTER_START") != std::string::npos);
++    CHECK(plate_gcode.find("; OTHER_PRINTER_START") != std::string::npos);
++    CHECK(plate_gcode.find("; PROJECT_PRINTER_START") == std::string::npos);
++}
+diff --git a/tests/libslic3r/CMakeLists.txt b/tests/libslic3r/CMakeLists.txt
+index 7255e5d3..e45f94d9 100644
+--- a/tests/libslic3r/CMakeLists.txt
++++ b/tests/libslic3r/CMakeLists.txt
+@@ -63,6 +63,7 @@ add_executable(${_TEST_NAME}_tests
+     test_imex_zones.cpp
+     test_multimaterial_segmentation.cpp
+     test_placeholder_parser.cpp
++    test_plate_preset_override.cpp
+     test_png_read_write.cpp
+     test_polygon.cpp
+     test_mutable_polygon.cpp
+diff --git a/tests/libslic3r/test_3mf.cpp b/tests/libslic3r/test_3mf.cpp
+index 88175349..76733ace 100644
+--- a/tests/libslic3r/test_3mf.cpp
++++ b/tests/libslic3r/test_3mf.cpp
+@@ -2900,3 +2900,63 @@ SCENARIO("a rendered no-light thumbnail does not suppress the plate thumbnail",
+         }
+     }
+ }
++
++TEST_CASE("Per-plate printer and process presets survive a 3MF round-trip", "[3mf][PlatePresetOverride]")
++{
++    ScopedSlic3rTemporaryDir temporary_dir("orca_plate_presets");
++
++    Model model;
++    ModelObject *object = model.add_object();
++    object->add_volume(make_cube(10.0, 10.0, 10.0));
++    object->add_instance();
++    model.set_backup_path((temporary_dir.path() / "source_backup").string());
++
++    // The names carry XML special characters, which the writer must escape.
++    const std::string printer = "Acme \"Mini\" & <Co> 0.4 nozzle";
++    const std::string process = "0.20mm Standard @Acme";
++
++    // Plate 1 keeps the project's presets, plate 2 names its own printer and process, plate 3 only a process.
++    std::vector<std::unique_ptr<PlateData>> plates;
++    for (int i = 0; i < 3; ++i) {
++        plates.push_back(std::make_unique<PlateData>());
++        plates.back()->plate_index = i;
++    }
++    plates[1]->printer_preset_override = printer;
++    plates[1]->process_preset_override = process;
++    plates[2]->process_preset_override = process;
++
++    DynamicPrintConfig config;
++    const std::string  path = (temporary_dir.path() / "plate_presets.3mf").string();
++    StoreParams        store_params;
++    store_params.path   = path.c_str();
++    store_params.model  = &model;
++    store_params.config = &config;
++    for (const auto &plate : plates)
++        store_params.plate_data_list.push_back(plate.get());
++    store_params.strategy = SaveStrategy::Zip64 | SaveStrategy::Silence;
++    REQUIRE(store_bbs_3mf(store_params));
++
++    Model                     reloaded_model;
++    DynamicPrintConfig        reloaded_config;
++    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Disable};
++    PlateDataPtrs             reloaded;
++    std::vector<Preset *>     project_presets;
++    bool                      is_bbl_3mf  = false;
++    bool                      is_orca_3mf = false;
++    Semver                    file_version;
++    const bool loaded = load_bbs_3mf(path.c_str(), &reloaded_config, &substitutions, &reloaded_model, &reloaded,
++                                     &project_presets, &is_bbl_3mf, &is_orca_3mf, &file_version, nullptr,
++                                     LoadStrategy::LoadModel | LoadStrategy::LoadConfig);
++    std::vector<std::pair<std::string, std::string>> overrides;
++    for (const PlateData *plate : reloaded)
++        overrides.emplace_back(plate->printer_preset_override, plate->process_preset_override);
++    release_PlateData_list(reloaded);
++    for (Preset *preset : project_presets)
++        delete preset;
++
++    REQUIRE(loaded);
++    REQUIRE(overrides.size() == 3);
++    CHECK(overrides[0] == std::make_pair(std::string(), std::string()));
++    CHECK(overrides[1] == std::make_pair(printer, process));
++    CHECK(overrides[2] == std::make_pair(std::string(), process));
++}
+diff --git a/tests/libslic3r/test_plate_preset_override.cpp b/tests/libslic3r/test_plate_preset_override.cpp
+new file mode 100644
+index 00000000..c98da088
+--- /dev/null
++++ b/tests/libslic3r/test_plate_preset_override.cpp
+@@ -0,0 +1,132 @@
++#include <catch2/catch_test_macros.hpp>
++
++#include <string>
++#include <vector>
++
++#include "libslic3r/Config.hpp"
++#include "libslic3r/PlatePresetOverride.hpp"
++#include "libslic3r/Point.hpp"
++#include "libslic3r/Preset.hpp"
++#include "libslic3r/PresetBundle.hpp"
++#include "libslic3r/PrintConfig.hpp"
++
++using namespace Slic3r;
++
++namespace {
++
++const Pointfs project_bed { { 0., 0. }, { 256., 0. }, { 256., 256. }, { 0., 256. } };
++const Pointfs other_bed   { { 0., 0. }, { 180., 0. }, { 180., 180. }, { 0., 180. } };
++
++// A bundle whose selected printer has `project_bed`, plus an unselected "Other Printer" with
++// `other_bed`, a printer with two extruders and a process preset with a 0.12 mm layer height.
++struct Fixture
++{
++    PresetBundle bundle;
++
++    Fixture()
++    {
++        DynamicPrintConfig &project_printer = bundle.printers.get_edited_preset().config;
++        project_printer.set_key_value("printable_area", new ConfigOptionPoints(project_bed));
++        project_printer.set_key_value("printable_height", new ConfigOptionFloat(250.));
++        project_printer.set_key_value("machine_start_gcode", new ConfigOptionString("; project start"));
++
++        DynamicPrintConfig other = bundle.printers.default_preset().config;
++        other.set_key_value("printable_area", new ConfigOptionPoints(other_bed));
++        other.set_key_value("printable_height", new ConfigOptionFloat(180.));
++        other.set_key_value("machine_start_gcode", new ConfigOptionString("; other start"));
++        bundle.printers.load_preset(std::string(), "Other Printer", other, false);
++
++        DynamicPrintConfig dual = bundle.printers.default_preset().config;
++        dual.set_key_value("nozzle_diameter", new ConfigOptionFloats({ 0.4, 0.4 }));
++        bundle.printers.load_preset(std::string(), "Dual Printer", dual, false);
++
++        DynamicPrintConfig fine = bundle.prints.default_preset().config;
++        fine.set_key_value("layer_height", new ConfigOptionFloat(0.12));
++        bundle.prints.load_preset(std::string(), "Fine Process", fine, false);
++
++        bundle.prints.get_edited_preset().config.set_key_value("layer_height", new ConfigOptionFloat(0.2));
++        bundle.filaments.get_edited_preset().config.set_key_value("filament_type", new ConfigOptionStrings({ "PETG" }));
++    }
++};
++
++} // namespace
++
++TEST_CASE("A plate printer replaces the printer settings and keeps the others", "[PlatePresetOverride]")
++{
++    Fixture            f;
++    DynamicPrintConfig config = f.bundle.full_config();
++    const std::vector<std::string> colours = config.option<ConfigOptionStrings>("filament_colour")->values;
++
++    const PlatePresetOverride override_ { "Other Printer", {} };
++    REQUIRE(apply_plate_preset_override(f.bundle, override_, config) == PlatePresetOverrideStatus::Ok);
++
++    CHECK(config.option<ConfigOptionPoints>("printable_area")->values == other_bed);
++    CHECK(config.opt_float("printable_height") == 180.);
++    CHECK(config.opt_string("machine_start_gcode") == "; other start");
++    CHECK(config.opt_string("printer_settings_id") == "Other Printer");
++    // The process, the filaments and the project settings stay the project's.
++    CHECK(config.opt_float("layer_height") == 0.2);
++    CHECK(config.option<ConfigOptionStrings>("filament_type")->values == std::vector<std::string>{ "PETG" });
++    CHECK(config.option<ConfigOptionStrings>("filament_colour")->values == colours);
++}
++
++TEST_CASE("A plate process replaces the process settings only", "[PlatePresetOverride]")
++{
++    Fixture            f;
++    DynamicPrintConfig config = f.bundle.full_config();
++
++    const PlatePresetOverride override_ { {}, "Fine Process" };
++    REQUIRE(apply_plate_preset_override(f.bundle, override_, config) == PlatePresetOverrideStatus::Ok);
++
++    CHECK(config.opt_float("layer_height") == 0.12);
++    CHECK(config.opt_string("print_settings_id") == "Fine Process");
++    CHECK(config.option<ConfigOptionPoints>("printable_area")->values == project_bed);
++    CHECK(config.opt_string("machine_start_gcode") == "; project start");
++}
++
++TEST_CASE("A plate without presets of its own leaves the project config alone", "[PlatePresetOverride]")
++{
++    Fixture                  f;
++    const DynamicPrintConfig project = f.bundle.full_config();
++    DynamicPrintConfig       config  = project;
++
++    CHECK(apply_plate_preset_override(f.bundle, PlatePresetOverride {}, config) == PlatePresetOverrideStatus::None);
++    CHECK(config == project);
++    CHECK(plate_preset_override_error(PlatePresetOverrideStatus::None, PlatePresetOverride {}).empty());
++}
++
++TEST_CASE("A plate preset that cannot be applied leaves the project config alone and is reported", "[PlatePresetOverride]")
++{
++    Fixture                  f;
++    const DynamicPrintConfig project = f.bundle.full_config();
++
++    struct Case
++    {
++        PlatePresetOverride       override_;
++        PlatePresetOverrideStatus status;
++        std::string               named;
++    };
++    const std::vector<Case> cases {
++        { { "Missing Printer", {} }, PlatePresetOverrideStatus::PrinterNotFound, "Missing Printer" },
++        { { {}, "Missing Process" }, PlatePresetOverrideStatus::ProcessNotFound, "Missing Process" },
++        { { "Dual Printer", {} }, PlatePresetOverrideStatus::ExtruderCountMismatch, "Dual Printer" },
++        // A missing process is reported even when the printer resolves.
++        { { "Other Printer", "Missing Process" }, PlatePresetOverrideStatus::ProcessNotFound, "Missing Process" },
++    };
++    for (const Case &c : cases) {
++        DYNAMIC_SECTION(c.named)
++        {
++            DynamicPrintConfig config = project;
++            CHECK(apply_plate_preset_override(f.bundle, c.override_, config) == c.status);
++            CHECK(config == project);
++            CHECK(plate_preset_override_error(c.status, c.override_).find(c.named) != std::string::npos);
++        }
++    }
++}
++
++TEST_CASE("A printer model outside the BBL bundle is not a BBL printer", "[PlatePresetOverride]")
++{
++    PresetBundle bundle;
++    CHECK_FALSE(is_bbl_printer_model(bundle, ""));
++    CHECK_FALSE(is_bbl_printer_model(bundle, "Acme One"));
++}
+-- 
+2.43.0
+

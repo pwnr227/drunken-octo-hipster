@@ -59,6 +59,7 @@ flowchart LR
 | [bom/HX5-BOM.csv](bom/HX5-BOM.csv) | Bill of materials with manufacturer part numbers |
 | [firmware/README.md](firmware/README.md) | How to build and flash Klipper (USB or CAN) |
 | [firmware/hx5.cfg](firmware/hx5.cfg) | Klipper config include for the board: 5 heaters, fans, monitoring, interlock |
+| [orca-per-plate-printers/](orca-per-plate-printers/README.md) | OrcaSlicer patch: a different printer (and process) per build plate in one project |
 
 ## Connector summary
 
